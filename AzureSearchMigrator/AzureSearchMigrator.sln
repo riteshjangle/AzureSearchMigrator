@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.36414.22 d17.14
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AzureSearchMigrator", "AzureSearchMigrator\AzureSearchMigrator.csproj", "{B30D0D7A-E2ED-44E3-A2A4-349A71BCBA4F}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B30D0D7A-E2ED-44E3-A2A4-349A71BCBA4F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B30D0D7A-E2ED-44E3-A2A4-349A71BCBA4F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B30D0D7A-E2ED-44E3-A2A4-349A71BCBA4F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B30D0D7A-E2ED-44E3-A2A4-349A71BCBA4F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {7483EDE3-3B5D-4610-B9B5-D9CC6E61E814}
+	EndGlobalSection
+EndGlobal
