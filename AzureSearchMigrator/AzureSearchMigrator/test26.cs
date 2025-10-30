@@ -1,3 +1,13 @@
+Estimated batches :109
+
+Batch 95:1000 docs =Total 95000/108733
+Batch 96 :297 docs = Total 95297/108733
+Migration Complete
+Total Documents : 108733
+Missing Documents :13436
+Sucessful batches proceesed :96
+failed batches proceesed :96
+//
 using Azure;
 using Azure.Search.Documents;
 using Azure.Search.Documents.Models;
