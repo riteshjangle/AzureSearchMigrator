@@ -47,6 +47,7 @@ namespace AzureSearchMigrator
                 Console.WriteLine($"Source: {sourceServiceName}/{sourceIndexName}");
                 Console.WriteLine($"Target: {targetServiceName}/{targetIndexName}");
                 Console.WriteLine($"Batch Size: {batchSize}");
+                Console.WriteLine($"Pagination Method: $skip/$top");
                 Console.WriteLine();
 
                 // Step 1: Get index schema from source
@@ -73,9 +74,9 @@ namespace AzureSearchMigrator
                     return;
                 }
 
-                // Step 4: Migrate all data using REST API with search pagination
-                Console.WriteLine("Step 4: Migrating data using search pagination...");
-                await MigrateAllDocumentsViaRestApiAsync(
+                // Step 4: Migrate all data using $skip/$top pagination
+                Console.WriteLine("Step 4: Migrating data using $skip/$top pagination...");
+                await MigrateAllDocumentsWithSkipTopAsync(
                     sourceServiceName, sourceIndexName, sourceAdminApiKey,
                     targetServiceName, targetIndexName, targetAdminApiKey,
                     batchSize, totalDocuments, apiVersion);
@@ -260,64 +261,63 @@ namespace AzureSearchMigrator
             return 0;
         }
 
-        static async Task MigrateAllDocumentsViaRestApiAsync(
-      string sourceServiceName, string sourceIndexName, string sourceApiKey,
-      string targetServiceName, string targetIndexName, string targetApiKey,
-      int batchSize, int totalDocuments, string apiVersion)
+        static async Task MigrateAllDocumentsWithSkipTopAsync(
+            string sourceServiceName, string sourceIndexName, string sourceApiKey,
+            string targetServiceName, string targetIndexName, string targetApiKey,
+            int batchSize, int totalDocuments, string apiVersion)
         {
             int successfulBatches = 0;
             int failedBatches = 0;
             int totalMigratedDocuments = 0;
-            int batchNumber = 0;
             var startTime = DateTime.Now;
 
-            Console.WriteLine($"Starting migration of {totalDocuments:N0} documents...");
+            Console.WriteLine($"Starting migration of {totalDocuments:N0} documents using $skip/$top pagination...");
             Console.WriteLine($"Batch size: {batchSize}");
             Console.WriteLine(new string('=', 70));
 
             // Store failed batches for retry
-            var failedBatchesToRetry = new Queue<List<Dictionary<string, object>>>();
-            string continuationToken = null;
-            bool hasMoreDocuments = true;
+            var failedBatchesToRetry = new Queue<(int skip, List<Dictionary<string, object>> documents)>();
             int maxRetries = 3;
+            int maxConsecutiveFailures = 5;
             int consecutiveFailures = 0;
-            const int maxConsecutiveFailures = 5;
 
-            while (hasMoreDocuments || failedBatchesToRetry.Count > 0)
+            // Calculate total batches
+            int totalBatches = (int)Math.Ceiling((double)totalDocuments / batchSize);
+            Console.WriteLine($"Total batches to process: {totalBatches}");
+
+            // First pass: process all batches
+            for (int skip = 0; skip < totalDocuments; skip += batchSize)
             {
-                batchNumber++;
+                var batchNumber = (skip / batchSize) + 1;
                 List<Dictionary<string, object>> documents = null;
                 bool batchSuccess = false;
                 int retryCount = 0;
 
-                // First try to process failed batches, then get new documents
+                // First try to process failed batches
                 if (failedBatchesToRetry.Count > 0)
                 {
-                    documents = failedBatchesToRetry.Dequeue();
-                    Console.WriteLine($"🔄 Retrying failed batch with {documents.Count} documents...");
+                    var failedBatch = failedBatchesToRetry.Dequeue();
+                    skip = failedBatch.skip; // Adjust skip to retry the failed batch
+                    documents = failedBatch.documents;
+                    Console.WriteLine($"🔄 Retrying failed batch {batchNumber} (skip={skip}) with {documents.Count} documents...");
                 }
-                else if (hasMoreDocuments)
+                else
                 {
                     try
                     {
-                        Console.WriteLine($"Fetching batch {batchNumber} with continuation token: {(string.IsNullOrEmpty(continuationToken) ? "null" : "present")}");
+                        Console.WriteLine($"Fetching batch {batchNumber}/{totalBatches} (skip={skip}, top={batchSize})...");
 
-                        // Get documents using search with continuation
-                        var result = await GetDocumentsWithSearchAsync(
+                        documents = await GetDocumentsWithSkipTopAsync(
                             sourceServiceName, sourceIndexName, sourceApiKey,
-                            batchSize, "*", continuationToken, apiVersion);
-
-                        documents = result.documents;
-                        continuationToken = result.continuationToken;
+                            batchSize, skip, apiVersion);
 
                         if (documents == null || documents.Count == 0)
                         {
-                            Console.WriteLine("No more documents found.");
-                            hasMoreDocuments = false;
-                            continue;
+                            Console.WriteLine($"No documents returned for batch {batchNumber}. This might indicate all documents have been processed.");
+                            break;
                         }
 
-                        // Reset consecutive failures counter on successful fetch
+                        // Reset consecutive failures on successful fetch
                         consecutiveFailures = 0;
                     }
                     catch (Exception ex)
@@ -336,10 +336,6 @@ namespace AzureSearchMigrator
                         await Task.Delay(3000);
                         continue;
                     }
-                }
-                else
-                {
-                    break;
                 }
 
                 // Try to index the batch with retries
@@ -368,32 +364,24 @@ namespace AzureSearchMigrator
 
                             string status = failedBatchesToRetry.Count > 0 ? "🔄" : "✓";
                             Console.WriteLine(
-                                $"{status} Batch {batchNumber}: {documents.Count,4} docs - " +
+                                $"{status} Batch {batchNumber}/{totalBatches}: {documents.Count,4} docs - " +
                                 $"Total: {totalMigratedDocuments,7:N0}/{totalDocuments,7:N0} ({percentage,5:F1}%) - " +
                                 $"Speed: {documentsPerSecond,6:F1} doc/s - " +
-                                $"ETA: {eta:hh\\:mm\\:ss} - " +
-                                $"Continuation: {(string.IsNullOrEmpty(continuationToken) ? "null" : "set")}");
-
-                            // Check if we should continue
-                            if (string.IsNullOrEmpty(continuationToken))
-                            {
-                                hasMoreDocuments = false;
-                                Console.WriteLine("No continuation token received - assuming no more documents.");
-                            }
+                                $"ETA: {eta:hh\\:mm\\:ss}");
                         }
                         else
                         {
                             retryCount++;
                             if (retryCount < maxRetries)
                             {
-                                Console.WriteLine($"⚠ Batch {batchNumber} failed, retry {retryCount}/{maxRetries} in 5 seconds...");
+                                Console.WriteLine($"⚠ Batch {batchNumber} failed to index, retry {retryCount}/{maxRetries} in 5 seconds...");
                                 await Task.Delay(5000);
                             }
                             else
                             {
                                 failedBatches++;
                                 Console.WriteLine($"✗ Batch {batchNumber} failed after {maxRetries} retries. Adding to retry queue.");
-                                failedBatchesToRetry.Enqueue(documents);
+                                failedBatchesToRetry.Enqueue((skip, documents));
                             }
                         }
                     }
@@ -402,14 +390,14 @@ namespace AzureSearchMigrator
                         retryCount++;
                         if (retryCount < maxRetries)
                         {
-                            Console.WriteLine($"⚠ Batch {batchNumber} error: {ex.Message}, retry {retryCount}/{maxRetries} in 5 seconds...");
+                            Console.WriteLine($"⚠ Batch {batchNumber} error during indexing: {ex.Message}, retry {retryCount}/{maxRetries} in 5 seconds...");
                             await Task.Delay(5000);
                         }
                         else
                         {
                             failedBatches++;
                             Console.WriteLine($"✗ Batch {batchNumber} failed after {maxRetries} retries due to exception: {ex.Message}");
-                            failedBatchesToRetry.Enqueue(documents);
+                            failedBatchesToRetry.Enqueue((skip, documents));
                         }
                     }
                 }
@@ -420,11 +408,68 @@ namespace AzureSearchMigrator
                     await Task.Delay(100);
                 }
 
-                // Safety limit
-                if (batchNumber > (totalDocuments / Math.Max(batchSize, 1)) * 3 + 100)
+                // Safety check - if we're not making progress
+                if (batchNumber > totalBatches * 2)
                 {
                     Console.WriteLine("Safety limit reached - stopping migration due to excessive batches.");
                     break;
+                }
+            }
+
+            // Second pass: retry failed batches
+            if (failedBatchesToRetry.Count > 0)
+            {
+                Console.WriteLine($"\nRetrying {failedBatchesToRetry.Count} failed batches...");
+
+                int retryPass = 1;
+                const int maxRetryPasses = 3;
+
+                while (failedBatchesToRetry.Count > 0 && retryPass <= maxRetryPasses)
+                {
+                    Console.WriteLine($"\nRetry pass {retryPass}/{maxRetryPasses}");
+                    int batchesInThisPass = failedBatchesToRetry.Count;
+                    int successfulInThisPass = 0;
+
+                    for (int i = 0; i < batchesInThisPass; i++)
+                    {
+                        var failedBatch = failedBatchesToRetry.Dequeue();
+                        var batchNumber = (failedBatch.skip / batchSize) + 1;
+
+                        try
+                        {
+                            Console.WriteLine($"Retrying batch {batchNumber} (skip={failedBatch.skip})...");
+
+                            var success = await IndexDocumentsViaApiAsync(
+                                targetServiceName, targetIndexName, targetApiKey,
+                                failedBatch.documents, apiVersion);
+
+                            if (success)
+                            {
+                                successfulBatches++;
+                                successfulInThisPass++;
+                                totalMigratedDocuments += failedBatch.documents.Count;
+
+                                Console.WriteLine($"✅ Successfully retried batch {batchNumber}");
+                            }
+                            else
+                            {
+                                // Add back to queue for next retry pass
+                                failedBatchesToRetry.Enqueue(failedBatch);
+                                Console.WriteLine($"❌ Failed to retry batch {batchNumber}");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            // Add back to queue for next retry pass
+                            failedBatchesToRetry.Enqueue(failedBatch);
+                            Console.WriteLine($"❌ Error retrying batch {batchNumber}: {ex.Message}");
+                        }
+
+                        await Task.Delay(200);
+                    }
+
+                    Console.WriteLine($"Retry pass {retryPass}: {successfulInThisPass}/{batchesInThisPass} batches successful");
+                    retryPass++;
                 }
             }
 
@@ -437,13 +482,14 @@ namespace AzureSearchMigrator
             int missingCount = totalDocuments - totalMigratedDocuments;
             Console.WriteLine($"Discrepancy: {missingCount:N0}");
             Console.WriteLine($"Successful batches: {successfulBatches}");
-            Console.WriteLine($"Failed batches (after retries): {failedBatches}");
-            Console.WriteLine($"Total batches processed: {batchNumber}");
+            Console.WriteLine($"Failed batches (after retries): {failedBatchesToRetry.Count}");
+            Console.WriteLine($"Total batches processed: {successfulBatches + failedBatchesToRetry.Count}");
 
             if (totalTime.TotalSeconds > 0)
             {
                 double overallSpeed = totalMigratedDocuments / totalTime.TotalSeconds;
                 Console.WriteLine($"Overall speed: {overallSpeed:F2} documents/second");
+                Console.WriteLine($"Total time: {totalTime:hh\\:mm\\:ss}");
             }
 
             if (missingCount != 0)
@@ -462,9 +508,9 @@ namespace AzureSearchMigrator
                 apiVersion);
         }
 
-        static async Task<(List<Dictionary<string, object>> documents, string continuationToken)> GetDocumentsWithSearchAsync(
-     string serviceName, string indexName, string apiKey,
-     int top, string searchText, string continuationToken, string apiVersion)
+        static async Task<List<Dictionary<string, object>>> GetDocumentsWithSkipTopAsync(
+            string serviceName, string indexName, string apiKey,
+            int top, int skip, string apiVersion)
         {
             try
             {
@@ -478,34 +524,25 @@ namespace AzureSearchMigrator
 
                     var searchRequest = new
                     {
-                        search = searchText,
+                        search = "*",
                         top = top,
+                        skip = skip,
                         queryType = "simple",
                         searchMode = "all",
-                        // Add select to get only document fields, not search metadata
-                        select = "*"
+                        select = "*",  // Get all fields
+                        orderby = "search.score() desc"  // Ensure consistent ordering
                     };
 
                     var content = new StringContent(JsonSerializer.Serialize(searchRequest), Encoding.UTF8, "application/json");
-
-                    // Add continuation token as header if we have one
-                    if (!string.IsNullOrEmpty(continuationToken))
-                    {
-                        httpClient.DefaultRequestHeaders.Remove("continuationToken");
-                        httpClient.DefaultRequestHeaders.Add("continuationToken", continuationToken);
-                    }
-
                     var response = await httpClient.PostAsync(url, content);
 
                     if (response.IsSuccessStatusCode)
                     {
                         var json = await response.Content.ReadAsStringAsync();
                         var documents = new List<Dictionary<string, object>>();
-                        string nextContinuationToken = null;
 
                         using (var doc = JsonDocument.Parse(json))
                         {
-                            // Extract documents
                             if (doc.RootElement.TryGetProperty("value", out var valueArray))
                             {
                                 foreach (var element in valueArray.EnumerateArray())
@@ -521,49 +558,29 @@ namespace AzureSearchMigrator
                                     documents.Add(documentDict);
                                 }
                             }
-
-                            // Try to get continuation token from response headers
-                            if (response.Headers.TryGetValues("continuationToken", out var tokenValues))
-                            {
-                                nextContinuationToken = tokenValues.FirstOrDefault();
-                            }
-
-                            // Also try to get from @odata.nextLink if available
-                            if (string.IsNullOrEmpty(nextContinuationToken) &&
-                                doc.RootElement.TryGetProperty("@odata.nextLink", out var nextLinkElement))
-                            {
-                                var nextLink = nextLinkElement.GetString();
-                                if (!string.IsNullOrEmpty(nextLink))
-                                {
-                                    var uri = new Uri(nextLink);
-                                    var queryParams = System.Web.HttpUtility.ParseQueryString(uri.Query);
-                                    nextContinuationToken = queryParams["continuationToken"];
-                                }
-                            }
                         }
 
-                        Console.WriteLine($"Retrieved {documents.Count} documents. Continuation token: {(string.IsNullOrEmpty(nextContinuationToken) ? "null" : "present")}");
-                        return (documents, nextContinuationToken);
+                        return documents;
                     }
                     else
                     {
-                        var errorContent = await response.Content.ReadAsStringAsync();
-                        Console.WriteLine($"Failed to search documents: {response.StatusCode}, Error: {errorContent}");
+                        var error = await response.Content.ReadAsStringAsync();
+                        Console.WriteLine($"Failed to get documents with skip/top: {response.StatusCode}, Error: {error}");
 
-                        // If it's a bad request, try without continuation token
-                        if (response.StatusCode == System.Net.HttpStatusCode.BadRequest && !string.IsNullOrEmpty(continuationToken))
+                        // If it's a bad request, it might be due to skip being too large
+                        if (response.StatusCode == System.Net.HttpStatusCode.BadRequest)
                         {
-                            Console.WriteLine("Bad request with continuation token, retrying without it...");
-                            return await GetDocumentsWithSearchAsync(serviceName, indexName, apiKey, top, searchText, null, apiVersion);
+                            Console.WriteLine("Bad request - this might indicate all documents have been processed.");
+                            return new List<Dictionary<string, object>>();
                         }
 
-                        throw new Exception($"Search API error: {response.StatusCode} - {errorContent}");
+                        throw new Exception($"Search API error: {response.StatusCode} - {error}");
                     }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error searching documents via API: {ex.Message}");
+                Console.WriteLine($"Error getting documents with skip/top: {ex.Message}");
                 throw;
             }
         }
