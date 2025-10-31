@@ -261,9 +261,9 @@ namespace AzureSearchMigrator
         }
 
         static async Task MigrateAllDocumentsViaRestApiAsync(
-            string sourceServiceName, string sourceIndexName, string sourceApiKey,
-            string targetServiceName, string targetIndexName, string targetApiKey,
-            int batchSize, int totalDocuments, string apiVersion)
+      string sourceServiceName, string sourceIndexName, string sourceApiKey,
+      string targetServiceName, string targetIndexName, string targetApiKey,
+      int batchSize, int totalDocuments, string apiVersion)
         {
             int successfulBatches = 0;
             int failedBatches = 0;
@@ -280,6 +280,8 @@ namespace AzureSearchMigrator
             string continuationToken = null;
             bool hasMoreDocuments = true;
             int maxRetries = 3;
+            int consecutiveFailures = 0;
+            const int maxConsecutiveFailures = 5;
 
             while (hasMoreDocuments || failedBatchesToRetry.Count > 0)
             {
@@ -298,6 +300,8 @@ namespace AzureSearchMigrator
                 {
                     try
                     {
+                        Console.WriteLine($"Fetching batch {batchNumber} with continuation token: {(string.IsNullOrEmpty(continuationToken) ? "null" : "present")}");
+
                         // Get documents using search with continuation
                         var result = await GetDocumentsWithSearchAsync(
                             sourceServiceName, sourceIndexName, sourceApiKey,
@@ -312,10 +316,22 @@ namespace AzureSearchMigrator
                             hasMoreDocuments = false;
                             continue;
                         }
+
+                        // Reset consecutive failures counter on successful fetch
+                        consecutiveFailures = 0;
                     }
                     catch (Exception ex)
                     {
+                        consecutiveFailures++;
                         Console.WriteLine($"✗ Error fetching batch {batchNumber}: {ex.Message}");
+                        Console.WriteLine($"Consecutive failures: {consecutiveFailures}/{maxConsecutiveFailures}");
+
+                        if (consecutiveFailures >= maxConsecutiveFailures)
+                        {
+                            Console.WriteLine("Too many consecutive failures, stopping migration.");
+                            break;
+                        }
+
                         failedBatches++;
                         await Task.Delay(3000);
                         continue;
@@ -339,6 +355,7 @@ namespace AzureSearchMigrator
                         {
                             successfulBatches++;
                             totalMigratedDocuments += documents.Count;
+                            consecutiveFailures = 0; // Reset on successful indexing
 
                             double percentage = (double)totalMigratedDocuments / totalDocuments * 100;
                             var elapsed = DateTime.Now - startTime;
@@ -354,12 +371,14 @@ namespace AzureSearchMigrator
                                 $"{status} Batch {batchNumber}: {documents.Count,4} docs - " +
                                 $"Total: {totalMigratedDocuments,7:N0}/{totalDocuments,7:N0} ({percentage,5:F1}%) - " +
                                 $"Speed: {documentsPerSecond,6:F1} doc/s - " +
-                                $"ETA: {eta:hh\\:mm\\:ss}");
+                                $"ETA: {eta:hh\\:mm\\:ss} - " +
+                                $"Continuation: {(string.IsNullOrEmpty(continuationToken) ? "null" : "set")}");
 
-                            // Update continuation only on success
+                            // Check if we should continue
                             if (string.IsNullOrEmpty(continuationToken))
                             {
                                 hasMoreDocuments = false;
+                                Console.WriteLine("No continuation token received - assuming no more documents.");
                             }
                         }
                         else
@@ -444,8 +463,8 @@ namespace AzureSearchMigrator
         }
 
         static async Task<(List<Dictionary<string, object>> documents, string continuationToken)> GetDocumentsWithSearchAsync(
-            string serviceName, string indexName, string apiKey,
-            int top, string searchText, string continuationToken, string apiVersion)
+     string serviceName, string indexName, string apiKey,
+     int top, string searchText, string continuationToken, string apiVersion)
         {
             try
             {
@@ -463,7 +482,8 @@ namespace AzureSearchMigrator
                         top = top,
                         queryType = "simple",
                         searchMode = "all",
-                        includeTotalResultCount = true
+                        // Add select to get only document fields, not search metadata
+                        select = "*"
                     };
 
                     var content = new StringContent(JsonSerializer.Serialize(searchRequest), Encoding.UTF8, "application/json");
@@ -471,7 +491,8 @@ namespace AzureSearchMigrator
                     // Add continuation token as header if we have one
                     if (!string.IsNullOrEmpty(continuationToken))
                     {
-                        content.Headers.Add("continuationToken", continuationToken);
+                        httpClient.DefaultRequestHeaders.Remove("continuationToken");
+                        httpClient.DefaultRequestHeaders.Add("continuationToken", continuationToken);
                     }
 
                     var response = await httpClient.PostAsync(url, content);
@@ -507,23 +528,35 @@ namespace AzureSearchMigrator
                                 nextContinuationToken = tokenValues.FirstOrDefault();
                             }
 
-                            // Fallback to nextLink
+                            // Also try to get from @odata.nextLink if available
                             if (string.IsNullOrEmpty(nextContinuationToken) &&
                                 doc.RootElement.TryGetProperty("@odata.nextLink", out var nextLinkElement))
                             {
                                 var nextLink = nextLinkElement.GetString();
-                                var uri = new Uri(nextLink);
-                                var queryParams = System.Web.HttpUtility.ParseQueryString(uri.Query);
-                                nextContinuationToken = queryParams["continuationToken"];
+                                if (!string.IsNullOrEmpty(nextLink))
+                                {
+                                    var uri = new Uri(nextLink);
+                                    var queryParams = System.Web.HttpUtility.ParseQueryString(uri.Query);
+                                    nextContinuationToken = queryParams["continuationToken"];
+                                }
                             }
                         }
 
+                        Console.WriteLine($"Retrieved {documents.Count} documents. Continuation token: {(string.IsNullOrEmpty(nextContinuationToken) ? "null" : "present")}");
                         return (documents, nextContinuationToken);
                     }
                     else
                     {
                         var errorContent = await response.Content.ReadAsStringAsync();
                         Console.WriteLine($"Failed to search documents: {response.StatusCode}, Error: {errorContent}");
+
+                        // If it's a bad request, try without continuation token
+                        if (response.StatusCode == System.Net.HttpStatusCode.BadRequest && !string.IsNullOrEmpty(continuationToken))
+                        {
+                            Console.WriteLine("Bad request with continuation token, retrying without it...");
+                            return await GetDocumentsWithSearchAsync(serviceName, indexName, apiKey, top, searchText, null, apiVersion);
+                        }
+
                         throw new Exception($"Search API error: {response.StatusCode} - {errorContent}");
                     }
                 }
