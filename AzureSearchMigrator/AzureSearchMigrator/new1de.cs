@@ -275,95 +275,136 @@ namespace AzureSearchMigrator
             Console.WriteLine($"Batch size: {batchSize}");
             Console.WriteLine(new string('=', 70));
 
-            string searchText = "*";
+            // Store failed batches for retry
+            var failedBatchesToRetry = new Queue<List<Dictionary<string, object>>>();
             string continuationToken = null;
             bool hasMoreDocuments = true;
+            int maxRetries = 3;
 
-            while (hasMoreDocuments)
+            while (hasMoreDocuments || failedBatchesToRetry.Count > 0)
             {
                 batchNumber++;
                 List<Dictionary<string, object>> documents = null;
                 bool batchSuccess = false;
+                int retryCount = 0;
 
-                try
+                // First try to process failed batches, then get new documents
+                if (failedBatchesToRetry.Count > 0)
                 {
-                    // Get documents using search with continuation
-                    var result = await GetDocumentsWithSearchAsync(
-                        sourceServiceName, sourceIndexName, sourceApiKey,
-                        batchSize, searchText, continuationToken, apiVersion);
-
-                    documents = result.documents;
-                    continuationToken = result.continuationToken;
-
-                    if (documents == null || documents.Count == 0)
+                    documents = failedBatchesToRetry.Dequeue();
+                    Console.WriteLine($"🔄 Retrying failed batch with {documents.Count} documents...");
+                }
+                else if (hasMoreDocuments)
+                {
+                    try
                     {
-                        Console.WriteLine("No more documents found.");
-                        hasMoreDocuments = false;
-                        break;
+                        // Get documents using search with continuation
+                        var result = await GetDocumentsWithSearchAsync(
+                            sourceServiceName, sourceIndexName, sourceApiKey,
+                            batchSize, "*", continuationToken, apiVersion);
+
+                        documents = result.documents;
+                        continuationToken = result.continuationToken;
+
+                        if (documents == null || documents.Count == 0)
+                        {
+                            Console.WriteLine("No more documents found.");
+                            hasMoreDocuments = false;
+                            continue;
+                        }
                     }
-
-                    // Index the batch
-                    batchSuccess = await IndexDocumentsViaApiAsync(
-                        targetServiceName, targetIndexName, targetApiKey,
-                        documents, apiVersion);
-
-                    if (batchSuccess)
+                    catch (Exception ex)
                     {
-                        successfulBatches++;
-                        totalMigratedDocuments += documents.Count;
-
-                        double percentage = (double)totalMigratedDocuments / totalDocuments * 100;
-                        var elapsed = DateTime.Now - startTime;
-                        var documentsPerSecond = totalMigratedDocuments / Math.Max(elapsed.TotalSeconds, 1);
-
-                        // Calculate ETA
-                        var remainingDocuments = totalDocuments - totalMigratedDocuments;
-                        var estimatedTimeRemaining = remainingDocuments / Math.Max(documentsPerSecond, 1);
-                        var eta = TimeSpan.FromSeconds(estimatedTimeRemaining);
-
-                        Console.WriteLine(
-                            $"✓ Batch {batchNumber}: {documents.Count,4} docs - " +
-                            $"Total: {totalMigratedDocuments,7:N0}/{totalDocuments,7:N0} ({percentage,5:F1}%) - " +
-                            $"Speed: {documentsPerSecond,6:F1} doc/s - " +
-                            $"ETA: {eta:hh\\:mm\\:ss}");
-                    }
-                    else
-                    {
+                        Console.WriteLine($"✗ Error fetching batch {batchNumber}: {ex.Message}");
                         failedBatches++;
-                        Console.WriteLine($"✗ Batch {batchNumber}: Failed to index documents. Will retry this batch.");
-                        // Don't update continuationToken on failure - we'll retry the same batch
-                        continuationToken = null;
-                    }
-
-                    // If no continuation token, we've reached the end
-                    if (string.IsNullOrEmpty(continuationToken))
-                    {
-                        hasMoreDocuments = false;
-                    }
-
-                    // Small delay to avoid overwhelming the service
-                    if (batchSuccess)
-                    {
-                        await Task.Delay(500);
-                    }
-                    else
-                    {
-                        // Longer delay on failure before retry
                         await Task.Delay(3000);
+                        continue;
                     }
                 }
-                catch (Exception ex)
+                else
                 {
-                    failedBatches++;
-                    Console.WriteLine($"✗ Critical error processing batch {batchNumber}: {ex.Message}. Pausing before next attempt.");
-                    continuationToken = null; // Reset on critical error
-                    await Task.Delay(5000);
+                    break;
+                }
+
+                // Try to index the batch with retries
+                while (retryCount < maxRetries && !batchSuccess)
+                {
+                    try
+                    {
+                        batchSuccess = await IndexDocumentsViaApiAsync(
+                            targetServiceName, targetIndexName, targetApiKey,
+                            documents, apiVersion);
+
+                        if (batchSuccess)
+                        {
+                            successfulBatches++;
+                            totalMigratedDocuments += documents.Count;
+
+                            double percentage = (double)totalMigratedDocuments / totalDocuments * 100;
+                            var elapsed = DateTime.Now - startTime;
+                            var documentsPerSecond = totalMigratedDocuments / Math.Max(elapsed.TotalSeconds, 1);
+
+                            // Calculate ETA
+                            var remainingDocuments = totalDocuments - totalMigratedDocuments;
+                            var estimatedTimeRemaining = remainingDocuments / Math.Max(documentsPerSecond, 1);
+                            var eta = TimeSpan.FromSeconds(estimatedTimeRemaining);
+
+                            string status = failedBatchesToRetry.Count > 0 ? "🔄" : "✓";
+                            Console.WriteLine(
+                                $"{status} Batch {batchNumber}: {documents.Count,4} docs - " +
+                                $"Total: {totalMigratedDocuments,7:N0}/{totalDocuments,7:N0} ({percentage,5:F1}%) - " +
+                                $"Speed: {documentsPerSecond,6:F1} doc/s - " +
+                                $"ETA: {eta:hh\\:mm\\:ss}");
+
+                            // Update continuation only on success
+                            if (string.IsNullOrEmpty(continuationToken))
+                            {
+                                hasMoreDocuments = false;
+                            }
+                        }
+                        else
+                        {
+                            retryCount++;
+                            if (retryCount < maxRetries)
+                            {
+                                Console.WriteLine($"⚠ Batch {batchNumber} failed, retry {retryCount}/{maxRetries} in 5 seconds...");
+                                await Task.Delay(5000);
+                            }
+                            else
+                            {
+                                failedBatches++;
+                                Console.WriteLine($"✗ Batch {batchNumber} failed after {maxRetries} retries. Adding to retry queue.");
+                                failedBatchesToRetry.Enqueue(documents);
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        retryCount++;
+                        if (retryCount < maxRetries)
+                        {
+                            Console.WriteLine($"⚠ Batch {batchNumber} error: {ex.Message}, retry {retryCount}/{maxRetries} in 5 seconds...");
+                            await Task.Delay(5000);
+                        }
+                        else
+                        {
+                            failedBatches++;
+                            Console.WriteLine($"✗ Batch {batchNumber} failed after {maxRetries} retries due to exception: {ex.Message}");
+                            failedBatchesToRetry.Enqueue(documents);
+                        }
+                    }
+                }
+
+                // Small delay to avoid overwhelming the service
+                if (batchSuccess)
+                {
+                    await Task.Delay(100);
                 }
 
                 // Safety limit
-                if (batchNumber > (totalDocuments / batchSize) * 2 + 10)
+                if (batchNumber > (totalDocuments / Math.Max(batchSize, 1)) * 3 + 100)
                 {
-                    Console.WriteLine("Safety limit reached - stopping migration due to excessive retries or batches.");
+                    Console.WriteLine("Safety limit reached - stopping migration due to excessive batches.");
                     break;
                 }
             }
@@ -377,9 +418,8 @@ namespace AzureSearchMigrator
             int missingCount = totalDocuments - totalMigratedDocuments;
             Console.WriteLine($"Discrepancy: {missingCount:N0}");
             Console.WriteLine($"Successful batches: {successfulBatches}");
-            Console.WriteLine($"Failed batches (retried/skipped): {failedBatches}");
+            Console.WriteLine($"Failed batches (after retries): {failedBatches}");
             Console.WriteLine($"Total batches processed: {batchNumber}");
-            Console.WriteLine($"Total time: {totalTime:hh\\:mm\\:ss}");
 
             if (totalTime.TotalSeconds > 0)
             {
@@ -389,8 +429,18 @@ namespace AzureSearchMigrator
 
             if (missingCount != 0)
             {
-                Console.WriteLine($"\n⚠ Warning: There's a discrepancy of {missingCount:N0} documents. This could be due to documents being added/removed during migration or count inaccuracies.");
+                Console.WriteLine($"\n⚠ Warning: There's a discrepancy of {missingCount:N0} documents.");
+                Console.WriteLine("This could be due to:");
+                Console.WriteLine("  - Documents being added/removed during migration");
+                Console.WriteLine("  - Inaccurate initial document count");
+                Console.WriteLine("  - Failed batches that couldn't be recovered");
             }
+
+            // Verify final counts
+            await VerifyMigrationResultsAsync(
+                sourceServiceName, sourceIndexName, sourceApiKey,
+                targetServiceName, targetIndexName, targetApiKey,
+                apiVersion);
         }
 
         static async Task<(List<Dictionary<string, object>> documents, string continuationToken)> GetDocumentsWithSearchAsync(
@@ -401,6 +451,9 @@ namespace AzureSearchMigrator
             {
                 using (var httpClient = new HttpClient())
                 {
+                    // Set longer timeout for large batches
+                    httpClient.Timeout = TimeSpan.FromMinutes(5);
+
                     var url = $"https://{serviceName}.search.windows.net/indexes/{indexName}/docs/search?api-version={apiVersion}";
                     httpClient.DefaultRequestHeaders.Add("api-key", apiKey);
 
@@ -409,16 +462,18 @@ namespace AzureSearchMigrator
                         search = searchText,
                         top = top,
                         queryType = "simple",
+                        searchMode = "all",
                         includeTotalResultCount = true
                     };
 
-                    // Add continuation token if we have one
+                    var content = new StringContent(JsonSerializer.Serialize(searchRequest), Encoding.UTF8, "application/json");
+
+                    // Add continuation token as header if we have one
                     if (!string.IsNullOrEmpty(continuationToken))
                     {
-                        url += $"&continuationToken={Uri.EscapeDataString(continuationToken)}";
+                        content.Headers.Add("continuationToken", continuationToken);
                     }
 
-                    var content = new StringContent(JsonSerializer.Serialize(searchRequest), Encoding.UTF8, "application/json");
                     var response = await httpClient.PostAsync(url, content);
 
                     if (response.IsSuccessStatusCode)
@@ -437,7 +492,7 @@ namespace AzureSearchMigrator
                                     var documentDict = new Dictionary<string, object>();
                                     foreach (var prop in element.EnumerateObject())
                                     {
-                                        if (prop.Name.StartsWith("@search.") || prop.Name.StartsWith("@odata.")) 
+                                        if (prop.Name.StartsWith("@search.") || prop.Name.StartsWith("@odata."))
                                             continue;
 
                                         documentDict[prop.Name] = GetValueFromJsonElement(prop.Value);
@@ -446,8 +501,15 @@ namespace AzureSearchMigrator
                                 }
                             }
 
-                            // Extract continuation token for next page
-                            if (doc.RootElement.TryGetProperty("@odata.nextLink", out var nextLinkElement))
+                            // Try to get continuation token from response headers
+                            if (response.Headers.TryGetValues("continuationToken", out var tokenValues))
+                            {
+                                nextContinuationToken = tokenValues.FirstOrDefault();
+                            }
+
+                            // Fallback to nextLink
+                            if (string.IsNullOrEmpty(nextContinuationToken) &&
+                                doc.RootElement.TryGetProperty("@odata.nextLink", out var nextLinkElement))
                             {
                                 var nextLink = nextLinkElement.GetString();
                                 var uri = new Uri(nextLink);
@@ -462,14 +524,15 @@ namespace AzureSearchMigrator
                     {
                         var errorContent = await response.Content.ReadAsStringAsync();
                         Console.WriteLine($"Failed to search documents: {response.StatusCode}, Error: {errorContent}");
+                        throw new Exception($"Search API error: {response.StatusCode} - {errorContent}");
                     }
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error searching documents via API: {ex.Message}");
+                throw;
             }
-            return (new List<Dictionary<string, object>>(), null);
         }
 
         static async Task<bool> IndexDocumentsViaApiAsync(
@@ -480,6 +543,9 @@ namespace AzureSearchMigrator
             {
                 using (var httpClient = new HttpClient())
                 {
+                    // Set longer timeout for indexing
+                    httpClient.Timeout = TimeSpan.FromMinutes(5);
+
                     var url = $"https://{serviceName}.search.windows.net/indexes/{indexName}/docs/index?api-version={apiVersion}";
                     httpClient.DefaultRequestHeaders.Add("api-key", apiKey);
 
@@ -487,14 +553,14 @@ namespace AzureSearchMigrator
                     {
                         var operation = new Dictionary<string, object>(doc)
                         {
-                            { "@search.action", "upload" } 
+                            { "@search.action", "upload" }
                         };
                         return operation;
                     }).ToList();
 
                     var indexRequest = new
                     {
-                        value = indexOperations 
+                        value = indexOperations
                     };
 
                     var content = new StringContent(JsonSerializer.Serialize(indexRequest), Encoding.UTF8, "application/json");
@@ -517,6 +583,217 @@ namespace AzureSearchMigrator
                 Console.WriteLine($"Error indexing documents via API: {ex.Message}");
                 return false;
             }
+        }
+
+        static async Task VerifyMigrationResultsAsync(
+            string sourceServiceName, string sourceIndexName, string sourceApiKey,
+            string targetServiceName, string targetIndexName, string targetApiKey,
+            string apiVersion)
+        {
+            Console.WriteLine("\n=== VERIFYING MIGRATION RESULTS ===");
+
+            try
+            {
+                int sourceCount = await GetTotalDocumentCountViaApiAsync(sourceServiceName, sourceIndexName, sourceApiKey, apiVersion);
+                int targetCount = await GetTotalDocumentCountViaApiAsync(targetServiceName, targetIndexName, targetApiKey, apiVersion);
+
+                Console.WriteLine($"Source document count: {sourceCount:N0}");
+                Console.WriteLine($"Target document count: {targetCount:N0}");
+                Console.WriteLine($"Difference: {Math.Abs(sourceCount - targetCount):N0}");
+
+                if (sourceCount == targetCount)
+                {
+                    Console.WriteLine("✅ SUCCESS: Document counts match!");
+                }
+                else
+                {
+                    Console.WriteLine("❌ WARNING: Document counts do not match!");
+
+                    // If counts don't match, try a sample verification
+                    await VerifySampleDocumentsAsync(
+                        sourceServiceName, sourceIndexName, sourceApiKey,
+                        targetServiceName, targetIndexName, targetApiKey,
+                        apiVersion);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error verifying migration results: {ex.Message}");
+            }
+        }
+
+        static async Task VerifySampleDocumentsAsync(
+            string sourceServiceName, string sourceIndexName, string sourceApiKey,
+            string targetServiceName, string targetIndexName, string targetApiKey,
+            string apiVersion)
+        {
+            Console.WriteLine("\n=== VERIFYING SAMPLE DOCUMENTS ===");
+
+            try
+            {
+                // Get a few sample documents from source
+                var sourceSamples = await GetSampleDocumentsAsync(sourceServiceName, sourceIndexName, sourceApiKey, 5, apiVersion);
+                Console.WriteLine($"Retrieved {sourceSamples.Count} sample documents from source.");
+
+                // Try to find the same documents in target
+                int foundCount = 0;
+                foreach (var sample in sourceSamples)
+                {
+                    var keyField = FindKeyField(sample);
+                    if (keyField.HasValue)
+                    {
+                        var keyPair = keyField.Value;
+                        var found = await FindDocumentByKeyAsync(
+                            targetServiceName, targetIndexName, targetApiKey,
+                            keyPair.Key, keyPair.Value, apiVersion);
+
+                        if (found)
+                        {
+                            foundCount++;
+                        }
+                        else
+                        {
+                            Console.WriteLine($"❌ Document with key '{keyPair.Key}={keyPair.Value}' not found in target.");
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("⚠ Could not identify a key field for sample document.");
+                    }
+                }
+
+                Console.WriteLine($"Sample verification: {foundCount}/{sourceSamples.Count} documents found in target.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error during sample verification: {ex.Message}");
+            }
+        }
+
+        static async Task<List<Dictionary<string, object>>> GetSampleDocumentsAsync(
+            string serviceName, string indexName, string apiKey, int count, string apiVersion)
+        {
+            try
+            {
+                using (var httpClient = new HttpClient())
+                {
+                    var url = $"https://{serviceName}.search.windows.net/indexes/{indexName}/docs/search?api-version={apiVersion}";
+                    httpClient.DefaultRequestHeaders.Add("api-key", apiKey);
+
+                    var searchRequest = new
+                    {
+                        search = "*",
+                        top = count,
+                        queryType = "simple"
+                    };
+
+                    var content = new StringContent(JsonSerializer.Serialize(searchRequest), Encoding.UTF8, "application/json");
+                    var response = await httpClient.PostAsync(url, content);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var json = await response.Content.ReadAsStringAsync();
+                        var documents = new List<Dictionary<string, object>>();
+
+                        using (var doc = JsonDocument.Parse(json))
+                        {
+                            if (doc.RootElement.TryGetProperty("value", out var valueArray))
+                            {
+                                foreach (var element in valueArray.EnumerateArray())
+                                {
+                                    var documentDict = new Dictionary<string, object>();
+                                    foreach (var prop in element.EnumerateObject())
+                                    {
+                                        if (prop.Name.StartsWith("@search.") || prop.Name.StartsWith("@odata."))
+                                            continue;
+
+                                        documentDict[prop.Name] = GetValueFromJsonElement(prop.Value);
+                                    }
+                                    documents.Add(documentDict);
+                                }
+                            }
+                        }
+
+                        return documents;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error getting sample documents: {ex.Message}");
+            }
+
+            return new List<Dictionary<string, object>>();
+        }
+
+        static KeyValuePair<string, object>? FindKeyField(Dictionary<string, object> document)
+        {
+            // Common key field names in Azure Search
+            var commonKeyNames = new[] { "id", "key", "documentId", "docId", "recordId" };
+
+            foreach (var fieldName in commonKeyNames)
+            {
+                if (document.ContainsKey(fieldName) && document[fieldName] != null)
+                {
+                    return new KeyValuePair<string, object>(fieldName, document[fieldName]);
+                }
+            }
+
+            // If no common key found, use the first field
+            var firstField = document.FirstOrDefault();
+            if (!firstField.Equals(default(KeyValuePair<string, object>)))
+            {
+                return firstField;
+            }
+
+            return null;
+        }
+
+        static async Task<bool> FindDocumentByKeyAsync(
+            string serviceName, string indexName, string apiKey,
+            string keyField, object keyValue, string apiVersion)
+        {
+            try
+            {
+                using (var httpClient = new HttpClient())
+                {
+                    // Escape the key value for OData filter
+                    string escapedValue = keyValue.ToString().Replace("'", "''");
+                    var filter = $"{keyField} eq '{escapedValue}'";
+                    var url = $"https://{serviceName}.search.windows.net/indexes/{indexName}/docs/search?api-version={apiVersion}";
+                    httpClient.DefaultRequestHeaders.Add("api-key", apiKey);
+
+                    var searchRequest = new
+                    {
+                        search = "*",
+                        filter = filter,
+                        top = 1,
+                        queryType = "simple"
+                    };
+
+                    var content = new StringContent(JsonSerializer.Serialize(searchRequest), Encoding.UTF8, "application/json");
+                    var response = await httpClient.PostAsync(url, content);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var json = await response.Content.ReadAsStringAsync();
+                        using (var doc = JsonDocument.Parse(json))
+                        {
+                            if (doc.RootElement.TryGetProperty("value", out var valueArray) &&
+                                valueArray.GetArrayLength() > 0)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error searching for document by key: {ex.Message}");
+            }
+
+            return false;
         }
 
         static object GetValueFromJsonElement(JsonElement element)
